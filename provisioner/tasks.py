@@ -10,10 +10,45 @@ from django.utils import timezone
 from .models import ProvisionRequest
 from .dokploy_client import (
     deploy_compose, generate_domain_for_app, create_domain_for_compose,
-    poll_until, check_https_up, list_domains_for_compose, validate_domain
+    poll_until, check_https_up, list_domains_for_compose, validate_domain, get_or_create_project,
+    get_compose_one,update_compose, redeploy_compose
 )
 
 logger = logging.getLogger(__name__)
+
+
+def patch_compose_env_and_dump(compose_yaml_str, service_env_map):
+    """
+    compose_yaml_str -> modify each service environment variables based on service_env_map
+    service_env_map: { "service_name": {"VAR": "value", ...}, ... }
+    returns: updated YAML string
+    """
+    data = yaml.safe_load(compose_yaml_str)
+    services = data.get("services", {})
+
+    for svc_name, env_updates in service_env_map.items():
+        svc = services.get(svc_name)
+        if not svc:
+            # maybe name mismatch, skip
+            continue
+        # ensure environment exists as mapping
+        env_block = svc.get("environment") or {}
+        # if environment is a list, convert to dict
+        if isinstance(env_block, list):
+            # list of "KEY=VAL"
+            tmp = {}
+            for entry in env_block:
+                if isinstance(entry, str) and "=" in entry:
+                    k, v = entry.split("=", 1)
+                    tmp[k] = v
+            env_block = tmp
+        # apply updates
+        env_block.update(env_updates)
+        svc["environment"] = env_block
+        services[svc_name] = svc
+
+    data["services"] = services
+    return yaml.safe_dump(data, sort_keys=False)
 
 def build_compose_yaml(backend_repo, frontend_repo, tenant_suffix, db_name, db_user, db_password):
     """
@@ -70,27 +105,49 @@ def build_compose_yaml(backend_repo, frontend_repo, tenant_suffix, db_name, db_u
 
 def provision_tenant_task(prov_request_id, payload):
     """
-    Heavy lifting task. Run this in background (Celery or thread).
-    payload contains: email, company, subdomain, password, secrets...
+    Orchestrator task: create project, deploy compose, create domains,
+    patch compose envs (frontend -> backend URL), and call internal provision.
     """
     pr = ProvisionRequest.objects.get(id=prov_request_id)
+
     try:
         pr.status = "provisioning"
+        pr.detail += "\nStarting provisioning..."
         pr.save()
 
-        # settings
-        project_id = settings.DOKPLOY_PROJECT_ID
-        server_id = settings.DOKPLOY_SERVER_ID
-        backend_repo = payload.get("backend_repo", "https://github.com/vista/schoolcare-backend.git")
-        frontend_repo = payload.get("frontend_repo", "https://github.com/vista/schoolcare-frontend.git")
-
-        # generate tenant suffix/ids
+        # 1) generate tenant suffix/ids (do this early)
         tenant_suffix = uuid.uuid4().hex[:8]
         db_name = f"db_{tenant_suffix}"
         db_user = f"user_{tenant_suffix}"
         db_password = payload.get("password") or uuid.uuid4().hex[:12]
 
-        # 1) create & deploy compose
+        # 2) create or find Dokploy project (idempotent)
+        tenant_name = payload.get("client_ref") or f"lms-{tenant_suffix}"
+        project_desc = f"LMS tenant for {payload.get('company') or payload.get('email')}"
+        pr.detail += f"\nCreating/finding project {tenant_name}..."
+        pr.save()
+
+        proj_obj = get_or_create_project(name=tenant_name, description=project_desc)
+
+        proj_id = None
+        if isinstance(proj_obj, dict):
+            proj_id = proj_obj.get("id") or proj_obj.get("projectId") or proj_obj.get("_id")
+        elif isinstance(proj_obj, str):
+            proj_id = proj_obj.strip().strip('"')
+
+        if not proj_id:
+            pr.status = "failed"
+            pr.detail += f"\nFailed to create/find Dokploy project: {proj_obj}"
+            pr.save()
+            return
+
+        pr.project_id = proj_id
+        pr.save()
+
+        # 3) prepare compose YAML and deploy (use proj_id)
+        backend_repo = payload.get("backend_repo") or settings.BACKEND_REPO
+        frontend_repo = payload.get("frontend_repo") or settings.FRONTEND_REPO
+        
         compose_yaml, backend_service_name, frontend_service_name, db_service_name = build_compose_yaml(
             backend_repo,
             frontend_repo,
@@ -103,54 +160,57 @@ def provision_tenant_task(prov_request_id, payload):
         pr.detail += "\nDeploying compose..."
         pr.save()
 
-        deploy_resp = deploy_compose(project_id, server_id, f"lms-{tenant_suffix}", compose_yaml)
-        # deploy_resp might include 'id' or 'composeId' or 'applicationId'
-        compose_id = deploy_resp.get("id") or deploy_resp.get("composeId") or deploy_resp.get("applicationId")
+        server_id = settings.DOKPLOY_SERVER_ID
+        deploy_resp = deploy_compose(proj_id, f"lms-{tenant_suffix}", compose_yaml)
+
+        # parse compose_id (support multiple shapes)
+        compose_id = None
+        if isinstance(deploy_resp, dict):
+            compose_id = deploy_resp.get("id") or deploy_resp.get("composeId") or deploy_resp.get("applicationId")
+        elif isinstance(deploy_resp, str):
+            # maybe raw id string
+            compose_id = deploy_resp.strip().strip('"')
+
         if not compose_id:
-            # If deploy returned raw text or different structure, capture whole response for debugging
             pr.status = "failed"
             pr.detail += f"\ncompose.deploy returned unexpected response: {deploy_resp}"
             pr.save()
             return
 
+        pr.compose_id = compose_id
         pr.detail += f"\nCompose deployed: id={compose_id}"
         pr.save()
 
-        # 2) Generate (or create) backend domain and attach it to the backend service
+        # 4) generate backend domain (try generateDomain, fallback to create)
         backend_domain = None
         try:
-            # Try Dokploy domain.generateDomain using the compose/application id
             generated = generate_domain_for_app(compose_id)
-            # if function returned a string domain use it; else continue
             if isinstance(generated, str) and generated:
                 backend_domain = generated.strip().strip('"')
         except Exception as exc:
-            # fallback: forge a host and call domain.create with composeId + serviceName
             logger.warning("domain.generateDomain failed: %s", exc)
 
         if not backend_domain:
-            # fallback host
             host = f"{compose_id}-{tenant_suffix}.traefik.me"
-            # create domain targeted at compose & service
             create_resp = create_domain_for_compose(host, compose_id, backend_service_name, port=8000)
-            # create_resp may return object with id; the actual host is what we passed
             backend_domain = host
-            # optionally extract domain id:
             domain_id = create_resp.get("id") if isinstance(create_resp, dict) else None
             if domain_id:
-                validate_domain(domain_id)
+                try:
+                    validate_domain(domain_id)
+                except Exception:
+                    pass
 
+        pr.backend_domain = backend_domain
         pr.detail += f"\nBackend domain created: {backend_domain}"
         pr.save()
 
-        # 3) Wait until backend https responds (Let's Encrypt may take a short while)
+        # 5) wait for backend HTTPS to respond
         poll_until(lambda: (check_https_up(backend_domain), None), timeout=300, interval=5)
-        pr.detail += f"\nBackend domain is up: https://{backend_domain}"
+        pr.detail += f"\nBackend is up: https://{backend_domain}"
         pr.save()
 
-        # 4) Update frontend env to point to backend domain.
-        # Approach: call domain.generate/create for frontend and then call compose.update or redeploy.
-        # Simpler: create frontend domain now, get host, then instruct Dokploy to update compose env for frontend.
+        # 6) create frontend domain
         frontend_domain = None
         try:
             generated_f = generate_domain_for_app(compose_id)
@@ -160,18 +220,53 @@ def provision_tenant_task(prov_request_id, payload):
             frontend_domain = f"{compose_id}-fe-{tenant_suffix}.traefik.me"
             create_domain_for_compose(frontend_domain, compose_id, frontend_service_name, port=3000)
 
+        pr.frontend_domain = frontend_domain
         pr.detail += f"\nFrontend domain created: {frontend_domain}"
         pr.save()
 
-        # Wait until frontend https responds (optional)
+        # 7) Patch compose YAML to set ALLOWED_HOSTS on backend and REACT_APP_API_URL for frontend
+        pr.detail += "\nPatching compose environment with domains..."
+        pr.save()
+
+        # get current compose (compose.one returns current compose YAML in some Dokploy versions)
+        try:
+            current = get_compose_one(compose_id)
+            # assume current contains 'compose' (YAML string) or returns the YAML directly
+            existing_compose_yaml = None
+            if isinstance(current, dict):
+                existing_compose_yaml = current.get("compose") or current.get("data") or yaml.safe_dump(current)
+            else:
+                existing_compose_yaml = str(current)
+        except Exception:
+            # fallback to the compose we built earlier
+            existing_compose_yaml = compose_yaml
+
+        # build env updates
+        backend_api_url = f"https://{backend_domain}"
+        service_env_map = {
+            backend_service_name: {"ALLOWED_HOSTS": backend_domain},
+            frontend_service_name: {"REACT_APP_API_URL": backend_api_url}
+        }
+
+        updated_compose_yaml = patch_compose_env_and_dump(existing_compose_yaml, service_env_map)
+
+        # call compose.update + redeploy to apply env changes
+        update_compose_resp = update_compose(compose_id, updated_compose_yaml)
+        redeploy_compose(compose_id)
+
+        pr.detail += "\nCompose updated with new envs and redeploy triggered."
+        pr.save()
+
+        # 8) wait for frontend https (optional)
         try:
             poll_until(lambda: (check_https_up(frontend_domain), None), timeout=240, interval=5)
+            pr.detail += f"\nFrontend is up: https://{frontend_domain}"
+            pr.save()
         except Exception:
-            # not fatal — continue
-            pr.detail += f"\nFrontend https not responding yet; continue."
+            pr.detail += "\nFrontend not responding yet; continuing."
             pr.save()
 
-        # 5) Call internal provision endpoint on backend to create admin user
+        # 9) call internal provision endpoint to create admin
         prov_token = settings.PROVISION_CALLBACK_TOKEN
         admin_payload = {
             "admin_email": payload.get("email"),
@@ -181,7 +276,7 @@ def provision_tenant_task(prov_request_id, payload):
         }
         prov_url = f"https://{backend_domain}/internal/provision"
         headers = {"Content-Type": "application/json", "X-Provision-Token": prov_token}
-        # call once (could implement retries)
+
         resp = requests.post(prov_url, json=admin_payload, headers=headers, timeout=30, verify=False)
         if resp.status_code not in (200, 201):
             pr.status = "failed"
@@ -189,7 +284,6 @@ def provision_tenant_task(prov_request_id, payload):
             pr.save()
             return
 
-        # 6) Success
         pr.status = "completed"
         pr.detail += f"\nProvisioning complete. backend_url=https://{backend_domain}, frontend_url=https://{frontend_domain}"
         pr.save()

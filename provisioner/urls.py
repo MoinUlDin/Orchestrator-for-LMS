@@ -1,6 +1,6 @@
 from django.urls import path
-from .views import ProvisionView
+from .views import provision_request_view
 
 urlpatterns = [
-    path("provision/", ProvisionView.as_view(), name="provision"),
+    path("provision/", provision_request_view, name="provision"),
 ]

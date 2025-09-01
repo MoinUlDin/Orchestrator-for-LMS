@@ -98,6 +98,13 @@ DATABASES = {
 
 
 
+# Default repos (fallbacks)
+DEFAULT_BACKEND_REPO = "https://github.com/vista/schoolcare-backend.git"
+DEFAULT_FRONTEND_REPO = "https://github.com/vista/schoolcare-frontend.git"
+
+# Override from env (if provided)
+BACKEND_REPO = os.getenv("BACKEND_REPO", DEFAULT_BACKEND_REPO)
+FRONTEND_REPO = os.getenv("FRONTEND_REPO", DEFAULT_FRONTEND_REPO)
 
 # Email: simple console backend by default (dev)
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"

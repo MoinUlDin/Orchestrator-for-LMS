@@ -35,14 +35,13 @@ def _get(path, params=None, timeout=30):
         raise DokployError(f"GET {path} failed: {r.status_code} {r.text}")
     return r.json()
 
-def deploy_compose(project_id, server_id, name, compose_yaml):
+def deploy_compose(project_id, name, compose_yaml):
     """
     Deploy a single compose YAML to Dokploy.
     Returns response JSON (dokploy returns some object with id keys).
     """
     body = {
         "projectId": project_id,
-        "serverId": server_id,
         "name": name,
         "compose": compose_yaml,
         "restart": "always"
@@ -93,3 +92,39 @@ def check_https_up(domain, timeout=3):
         return r.status_code in (200, 301, 302)
     except Exception:
         return False
+
+
+def list_projects():
+    return _get("/project.all")
+
+def create_project(name, description=""):
+    body = {"name": name, "description": description, "env": ""}
+    return _post("/project.create", json=body)
+
+def get_or_create_project(name, description=""):
+    # Try to find existing project by name
+    projects = list_projects()
+    if isinstance(projects, dict):
+        # some Dokploy versions return {"data": [...]} -- try common patterns
+        candidates = projects.get("data") or projects.get("projects") or []
+    else:
+        candidates = projects
+
+    for p in candidates:
+        # project object often has 'id' and 'name'
+        if p.get("name") == name:
+            return p  # return full project object
+
+    # not found -> create
+    created = create_project(name=name, description=description)
+    # created usually includes id, but shape may vary; return created object
+    return created
+
+
+def update_compose(compose_id, compose_yaml):
+    """Update an existing compose stack (replace its compose)."""
+    body = {
+        "id": compose_id,
+        "compose": compose_yaml
+    }
+    return _post("/compose.update", json=body, timeout=120)
