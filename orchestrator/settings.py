@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     "rest_framework",
     "provisioner",
+    "django_apscheduler",
 ]
 
 MIDDLEWARE = [
@@ -75,6 +76,12 @@ TEMPLATES = [
         },
     },
 ]
+
+USE_TZ = True
+TIME_ZONE = "UTC"   # or your timezone
+
+# django-apscheduler settings (optional)
+DJANGO_APSCHEDULER_RUN_NOW_TIMEOUT = 1  # seconds for immediate jobs
 
 WSGI_APPLICATION = 'orchestrator.wsgi.application'
 
