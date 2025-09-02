@@ -6,6 +6,7 @@ from rest_framework import status
 from django.conf import settings
 from .models import ProvisionRequest
 from .tasks import provision_tenant_task
+from .dokploy_client import list_projects
 
 from .scheduler import schedule_provision_job
 import uuid
@@ -30,6 +31,7 @@ def provision_request_view(request):
     s1 = data.get("secret1")
     s2 = data.get("secret2")
     
+    print(f'\ns1: {s1} \nss: {settings.PROVISION_SECRET_1}\n')
     if s1 != settings.PROVISION_SECRET_1 or s2 != settings.PROVISION_SECRET_2:
         return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -76,3 +78,16 @@ def provision_request_view(request):
     job = schedule_provision_job(pr.id, payload, run_in_seconds=1)
 
     return Response({"detail": "accepted", "id": pr.id}, status=status.HTTP_202_ACCEPTED)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def executeme(request):
+    fun = request.data["fun"]
+    print(request.data)
+    r = None
+    if fun=='list_projects':
+        print('\n Getting project list\n')
+        p_list = list_projects()
+        print(f'\n we got list {p_list}')
+    
+    return Response({"ok": "got you"}, status=status.HTTP_200_OK)

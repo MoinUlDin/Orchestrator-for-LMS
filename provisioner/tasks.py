@@ -11,7 +11,7 @@ from .models import ProvisionRequest
 from .dokploy_client import (
     deploy_compose, generate_domain_for_app, create_domain_for_compose,
     poll_until, check_https_up, list_domains_for_compose, validate_domain, get_or_create_project,
-    get_compose_one,update_compose, redeploy_compose
+    get_compose_one,update_compose, redeploy_compose, create_compose
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ def patch_compose_env_and_dump(compose_yaml_str, service_env_map):
     data["services"] = services
     return yaml.safe_dump(data, sort_keys=False)
 
+
 def build_compose_yaml(backend_repo, frontend_repo, tenant_suffix, db_name, db_user, db_password):
     """
     Build a docker-compose YAML string with concrete env values.
@@ -64,7 +65,7 @@ def build_compose_yaml(backend_repo, frontend_repo, tenant_suffix, db_name, db_u
         "version": "3.8",
         "services": {
             backend_service: {
-                "build": {"context": backend_repo, "dockerfile": "Dockerfile"},
+                "build": {"context": backend_repo, "dockerfile": "DockerFile"},
                 "environment": {
                     "DB_NAME": db_name,
                     "DB_USER": db_user,
@@ -78,7 +79,7 @@ def build_compose_yaml(backend_repo, frontend_repo, tenant_suffix, db_name, db_u
                 "expose": ["8000"]
             },
             frontend_service: {
-                "build": {"context": frontend_repo, "dockerfile": "Dockerfile"},
+                "build": {"context": frontend_repo, "dockerfile": "DockerFile"},
                 "environment": {
                     "REACT_APP_API_URL": "",  # will update after backend domain is available
                 },
@@ -109,7 +110,7 @@ def provision_tenant_task(prov_request_id, payload):
     patch compose envs (frontend -> backend URL), and call internal provision.
     """
     pr = ProvisionRequest.objects.get(id=prov_request_id)
-
+    print("\ngot a request\n")
     try:
         pr.status = "provisioning"
         pr.detail += "\nStarting provisioning..."
@@ -126,7 +127,7 @@ def provision_tenant_task(prov_request_id, payload):
         project_desc = f"LMS tenant for {payload.get('company') or payload.get('email')}"
         pr.detail += f"\nCreating/finding project {tenant_name}..."
         pr.save()
-
+        print(f'\n creating or finding Project\n')
         proj_obj = get_or_create_project(name=tenant_name, description=project_desc)
 
         proj_id = None
@@ -135,6 +136,7 @@ def provision_tenant_task(prov_request_id, payload):
         elif isinstance(proj_obj, str):
             proj_id = proj_obj.strip().strip('"')
 
+        print(f'\n project created or not id: {proj_id} \n')
         if not proj_id:
             pr.status = "failed"
             pr.detail += f"\nFailed to create/find Dokploy project: {proj_obj}"
@@ -147,7 +149,8 @@ def provision_tenant_task(prov_request_id, payload):
         # 3) prepare compose YAML and deploy (use proj_id)
         backend_repo = payload.get("backend_repo") or settings.BACKEND_REPO
         frontend_repo = payload.get("frontend_repo") or settings.FRONTEND_REPO
-        
+        print(f'\n got b: {settings.BACKEND_REPO}')
+        print(f'\n got f: {settings.FRONTEND_REPO}')
         compose_yaml, backend_service_name, frontend_service_name, db_service_name = build_compose_yaml(
             backend_repo,
             frontend_repo,
@@ -156,14 +159,23 @@ def provision_tenant_task(prov_request_id, payload):
             db_user,
             db_password
         )
-
+        print(f'Buid Composer')
         pr.detail += "\nDeploying compose..."
         pr.save()
 
-        server_id = settings.DOKPLOY_SERVER_ID
-        deploy_resp = deploy_compose(proj_id, f"lms-{tenant_suffix}", compose_yaml)
+        deploy_resp = create_compose(
+        project_id=proj_id,
+        name=f"lms-{tenant_suffix}",
+        compose_yaml=compose_yaml,
+        app_name=f"lms-{tenant_suffix}",
+        description=f"Tenant compose for {payload.get('company') or payload.get('email')}"
+        )
+        
+        print(f"\nComposer- Created Successfully\n deploy_Resp: {deploy_resp}")
+        deploy_resp = deploy_compose(proj_id)
 
         # parse compose_id (support multiple shapes)
+        
         compose_id = None
         if isinstance(deploy_resp, dict):
             compose_id = deploy_resp.get("id") or deploy_resp.get("composeId") or deploy_resp.get("applicationId")
@@ -171,6 +183,7 @@ def provision_tenant_task(prov_request_id, payload):
             # maybe raw id string
             compose_id = deploy_resp.strip().strip('"')
 
+        print(f"\nComposer- Created ID: {compose_id}\n")
         if not compose_id:
             pr.status = "failed"
             pr.detail += f"\ncompose.deploy returned unexpected response: {deploy_resp}"
@@ -181,6 +194,7 @@ def provision_tenant_task(prov_request_id, payload):
         pr.detail += f"\nCompose deployed: id={compose_id}"
         pr.save()
 
+        print(f"\nGenerating Domains\n")
         # 4) generate backend domain (try generateDomain, fallback to create)
         backend_domain = None
         try:

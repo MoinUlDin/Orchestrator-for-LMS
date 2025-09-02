@@ -7,7 +7,7 @@ import uuid
 from django.conf import settings
 
 API_BASE = getattr(settings, "DOKPLOY_API", "https://dokploy.thevista.one/api")
-API_KEY = getattr(settings, "DOKPLOY_API_KEY", None)
+API_KEY = getattr(settings, "DOKPLOY_TOKEN", None)
 HEADERS = {
     "Accept": "application/json",
     "x-api-key": API_KEY,
@@ -17,7 +17,7 @@ HEADERS = {
 class DokployError(Exception):
     pass
 
-def _post(path, json=None, timeout=30):
+def _post(path, json=None, timeout=40):
     url = f"{API_BASE}{path}"
     r = requests.post(url, json=json or {}, headers=HEADERS, timeout=timeout)
     if not r.ok:
@@ -29,6 +29,7 @@ def _post(path, json=None, timeout=30):
         return r.text.strip().strip('"')
 
 def _get(path, params=None, timeout=30):
+    print(f"\n headers: {HEADERS}\n")
     url = f"{API_BASE}{path}"
     r = requests.get(url, headers=HEADERS, params=params or {}, timeout=timeout)
     if not r.ok:
@@ -128,3 +129,18 @@ def update_compose(compose_id, compose_yaml):
         "compose": compose_yaml
     }
     return _post("/compose.update", json=body, timeout=120)
+
+
+def create_compose(project_id, name, compose_yaml, app_name=None, description=""):
+    """
+    Create a new compose in Dokploy.
+    """
+    body = {
+        "name": name,
+        "description": description,
+        "projectId": project_id,
+        "composeType": "docker-compose",
+        "appName": app_name or name,
+        "composeFile": compose_yaml
+    }
+    return _post("/compose.create", json=body, timeout=240)

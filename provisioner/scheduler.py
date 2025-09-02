@@ -16,6 +16,7 @@ def start_scheduler():
     """Start scheduler if not already running. Call this in AppConfig.ready()."""
     if not scheduler.running:
         logger.info("Starting Django APScheduler...")
+        print("starting scheduler")
         scheduler.start(paused=False)
 
 def schedule_provision_job(prov_request_id, payload, run_in_seconds: int = 1):
