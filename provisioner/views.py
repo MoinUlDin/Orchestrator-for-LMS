@@ -6,7 +6,6 @@ from rest_framework import status
 from django.conf import settings
 from .models import ProvisionRequest
 from .tasks import provision_tenant_task
-from .dokploy_client import list_projects
 
 from .scheduler import schedule_provision_job
 import uuid
@@ -19,11 +18,12 @@ def provision_request_view(request):
     Expects JSON:
     {
       "client_ref": "optional-id",
-      "secret1": "...",
-      "secret2": "...",
-      "email": "...",
-      "company": "...",
-      "subdomain": "...",    # optional
+      "secret1": "...",         # Required
+      "secret2": "...",         # Required
+      "email": "...",           # Required
+      "client_name": "..."      # Required
+      "subdomain": "...",       # Required
+      "company": "...",      # optional
       "password": "..."      # admin password for internal provision
     }
     """
@@ -31,12 +31,26 @@ def provision_request_view(request):
     s1 = data.get("secret1")
     s2 = data.get("secret2")
     
-    print(f'\ns1: {s1} \nss: {settings.PROVISION_SECRET_1}\n')
     if s1 != settings.PROVISION_SECRET_1 or s2 != settings.PROVISION_SECRET_2:
         return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
 
     client_ref = data.get("client_ref")
-    # Idempotency: if client_ref exists and status completed, return info
+    client_name = data.get("client_name")  # required
+    subdomain = data.get("subdomain")
+    if not client_name:
+        return Response({"detail": "client_name is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not subdomain:
+        return Response({"detail": "subdomain is required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    if subdomain:
+        try:
+            existing = ProvisionRequest.objects.get(subdomain=subdomain)
+            if existing:
+                return Response({"detail": "Given subdomain already exist choose another one"}, status=status.HTTP_400_BAD_REQUEST)
+        except ProvisionRequest.DoesNotExist:
+            pass
+    # Idempotency: if client_ref exists
     if client_ref:
         try:
             existing = ProvisionRequest.objects.get(client_ref=client_ref)
@@ -57,8 +71,10 @@ def provision_request_view(request):
         except ProvisionRequest.DoesNotExist:
             pass
 
+    # Create ProvisionRequest
     pr = ProvisionRequest.objects.create(
         client_ref=client_ref,
+        client_name=client_name,
         email=data.get("email"),
         company=data.get("company", ""),
         subdomain=data.get("subdomain", ""),
@@ -74,8 +90,8 @@ def provision_request_view(request):
         "frontend_repo": data.get("frontend_repo"),
     }
 
-    # schedule using django-apscheduler (run after 1 second)
-    job = schedule_provision_job(pr.id, payload, run_in_seconds=1)
+    # Schedule project creation task
+    schedule_provision_job(pr.id, payload, run_in_seconds=1)
 
     return Response({"detail": "accepted", "id": pr.id}, status=status.HTTP_202_ACCEPTED)
 
@@ -87,7 +103,5 @@ def executeme(request):
     r = None
     if fun=='list_projects':
         print('\n Getting project list\n')
-        p_list = list_projects()
-        print(f'\n we got list {p_list}')
     
     return Response({"ok": "got you"}, status=status.HTTP_200_OK)
