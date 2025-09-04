@@ -42,8 +42,12 @@ class ProvisionRequest(models.Model):
     frontend_build_configured = models.BooleanField(default=False)
     frontend_deploy_triggered = models.BooleanField(default=False)
     domains_configured = models.BooleanField(default=False)
+    super_user_created = models.BooleanField(default=False)
     completed = models.BooleanField(default=False)
     failed = models.BooleanField(default=False)
+    
+    backend_health_tries = models.IntegerField(default=0)  # how many times we tried
+    backend_next_wait = models.IntegerField(default=60)
 
     
     def __str__(self):

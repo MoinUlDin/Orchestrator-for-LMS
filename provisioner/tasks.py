@@ -1,23 +1,23 @@
 # provisioner/tasks.py
-import logging, uuid, re, yaml, time
-import requests
+import logging, re, time
+from datetime import datetime, timedelta, timezone
 import secrets
 from django.conf import settings
-from django.utils import timezone
 from .utils import generate_project_name
-from .dokploy_client import _post, _get, DokployError
+from .scheduler import scheduler, backend_health_and_provision_attempt
+from .dokploy_client import _post, DokployError
 from .models import ProvisionRequest
-from .progress import mark_failure, mark_step, mark_running
 from .dokploy_client import (
     create_application,
     save_git_provider,
     save_build_type,
     save_environment,
     create_domain,
+    create_postgres,
     get_all_projects,
     deploy_postgres,
     deploy_application,
-    
+    delete_domain,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,48 +73,147 @@ def extract_id_from_resp(resp):
 
     return None
 
+
+
 def provision_tenant_task(prov_request_id, payload):
     """
-    Orchestrator task: create project, deploy compose, create domains,
-    patch compose envs (frontend -> backend URL), and call internal provision.
+    Orchestrator task (resume-aware). Steps:
+      1. create project
+      2. create backend service (create app, git, build)
+      3. create postgres, set backend env
+      4. deploy postgres then backend app
+      5. wait (only if we just triggered backend deploy)
+      6. create frontend service (create app, git, build, deploy)
+      7. create domains for both services
+      8. mark completed
     """
-    # Step 1: create project
-    success = create_project_task(prov_request_id)
+    global_deley = 2
+    try:
+        pr = ProvisionRequest.objects.get(id=prov_request_id)
+    except ProvisionRequest.DoesNotExist:
+        logger.error("provision_tenant_task: ProvisionRequest %s not found", prov_request_id)
+        return False
 
-    # At this point, we know if project creation succeeded
-    pr = ProvisionRequest.objects.get(id=prov_request_id)
-    if not success:
-        logger.error(f"Provisioning failed at project creation for {pr.client_name}")
-        return
-    
-    time.sleep(2) # giving dokploy some time to refresh db
-    ok = create_backend_service_task(prov_request_id)
-    if not ok:
-        print("process Failed while creating backend Service")
-        return
-    
-    time.sleep(1) # giving dokploy some time to refresh db
-    ok = create_postgres_task(prov_request_id)
-    if not ok:
-        return
+    # # If previously marked failed, bail out (you can change this to allow forced retries)
+    # if pr.failed:
+    #     logger.error("provision_tenant_task: ProvisionRequest %s is marked failed; aborting", prov_request_id)
+    #     return False
 
-    pg_resp, app_resp = deploy_db_then_app_quick(prov_request_id)
-    if pg_resp is None:
-        # DB deploy failed; pr.status already set to 'failed'
-        return
+    # ---------- Step 1: Project ----------
+    if not pr.project_created:
+        logger.info("provision_tenant_task: creating project for prov_request=%s", prov_request_id)
+        ok = create_project_task(prov_request_id)
+        if not ok:
+            logger.error("provision_tenant_task: create_project_task failed for prov_request=%s", prov_request_id)
+            return False
+    else:
+        logger.info("provision_tenant_task: project already created for prov_request=%s", prov_request_id)
+
+    # Refresh request
+    pr.refresh_from_db()
+
+    # ---------- Step 2: Backend service (resume-aware) ----------
+    if not (pr.backend_created and pr.backend_git_attached and pr.backend_build_configured):
+        logger.info("provision_tenant_task: running backend creation/config for prov_request=%s", prov_request_id)
+        ok = create_backend_service_task(prov_request_id)
+        if not ok:
+            logger.error("provision_tenant_task: create_backend_service_task failed for prov_request=%s", prov_request_id)
+            return False
+    else:
+        logger.info("provision_tenant_task: backend already created and configured for prov_request=%s", prov_request_id)
+
+    # Refresh request
+    pr.refresh_from_db()
+
+    # ---------- Step 3: Create Postgres & configure backend environment ----------
+    time.sleep(global_deley)
+    if not (pr.db_created and pr.backend_env_configured):
+        logger.info("provision_tenant_task: creating/configuring postgres for prov_request=%s", prov_request_id)
+        ok = create_postgres_task(prov_request_id)
+        if not ok:
+            logger.error("provision_tenant_task: create_postgres_task failed for prov_request=%s", prov_request_id)
+            return False
+    else:
+        logger.info("provision_tenant_task: DB already created and backend env configured for prov_request=%s", prov_request_id)
+
+    # Refresh before deploy checks
+    pr.refresh_from_db()
+    time.sleep(global_deley)
+    # ---------- Step 4: Deploy DB then backend app (resume-aware) ----------
+    # Save previous deploy-triggered state so we know whether to wait afterward
+    was_app_deploy_triggered = pr.backend_deploy_triggered
+    if not (pr.postgres_deploy_triggered and pr.backend_deploy_triggered):
+        logger.info("provision_tenant_task: triggering DB+app deploy for prov_request=%s", prov_request_id)
+        pg_resp, app_resp = deploy_db_then_app_quick(prov_request_id)
+        if pg_resp is None:
+            logger.error("provision_tenant_task: deploy_db_then_app_quick failed to trigger postgres for prov_request=%s", prov_request_id)
+            return False
+        # refresh to pick up any flags set by deploy_db_then_app_quick
+        pr.refresh_from_db()
+    else:
+        logger.info("provision_tenant_task: DB and backend deploy already triggered for prov_request=%s", prov_request_id)
+
+    # If the backend app.deploy was just triggered by this run (was not triggered before),
+    # wait a bit to let the backend start (original flow waited 240s).
+    pr.refresh_from_db()
+    just_triggered_app_deploy = (not was_app_deploy_triggered) and pr.backend_deploy_triggered
+    if just_triggered_app_deploy:
+        wait_seconds = getattr(settings, "BACKEND_DEPLOY_WAIT", 240)
+        logger.info("provision_tenant_task: backend deploy was just triggered; waiting %s seconds (prov_request=%s)",
+                    wait_seconds, prov_request_id)
+        time.sleep(wait_seconds)
+
+    # ---------- Step 5: Create Frontend (resume-aware) ----------
+    pr.refresh_from_db()
+    time.sleep(global_deley)
+    if not (pr.frontend_created and pr.frontend_git_attached and pr.frontend_build_configured and pr.frontend_deploy_triggered):
+        logger.info("provision_tenant_task: creating/configuring/deploying frontend for prov_request=%s", prov_request_id)
+        ok = create_frontend_service_task(prov_request_id)
+        if not ok:
+            logger.error("provision_tenant_task: create_frontend_service_task failed for prov_request=%s", prov_request_id)
+            return False
+    else:
+        logger.info("provision_tenant_task: frontend already created/configured/deployed for prov_request=%s", prov_request_id)
+
+    # ---------- Step 6: Create domains (atomic) ----------
+    time.sleep(global_deley)
+    pr.refresh_from_db()
+    if not pr.domains_configured:
+        logger.info("provision_tenant_task: creating domains for prov_request=%s", prov_request_id)
+        ok = create_domains_task(prov_request_id)
+        if not ok:
+            logger.error("provision_tenant_task: create_domains_task failed for prov_request=%s", prov_request_id)
+            return False
+    else:
+        logger.info("provision_tenant_task: domains already configured for prov_request=%s", prov_request_id)
+
     
-    print("\n Waiting for 4 menutes so that backend deployment got finished")
-    time.sleep(240) # giving backend some time to deploy
-    ok = create_frontend_service_task(prov_request_id)
-    if not ok:
-        return
     
-    ok = create_domains_task(prov_request_id)
-    if not ok:
-        return
-    
-    print("\njob Completed Successfully\n")
-    return
+    # ---------- Step 7: Kick off backend health + internal provision ----------
+    if not pr.super_user_created:
+        print("\n bakend Health & Internal Provission call after delay atleast 5 second")
+        pr.refresh_from_db()
+        dd = global_deley+5
+        time.sleep(dd)
+        logger.info("provision_tenant_task: scheduling backend health + internal provision for prov_request=%s", prov_request_id)
+        n_payload = {
+            "admin_email": payload.get("email"),       
+            "admin_password": payload.get("admin_password"),
+            }
+        scheduler.add_job(
+            backend_health_and_provision_attempt,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=global_deley),  # ✅ timezone-aware
+            args=[prov_request_id, n_payload],
+            id=f"backend_health_provision_{prov_request_id}",
+            replace_existing=True,
+        )
+
+    logger.info("provision_tenant_task: provisioning completed for prov_request=%s", prov_request_id)
+    print("\n\n ---------- Job Complete Successfully ---------- \n")
+    return True
+
+
     
 
 # 1 create Project 
@@ -125,48 +224,56 @@ def create_project_task(prov_request_id):
     if not pr.client_name:
         pr.status = "failed"
         pr.detail = "Missing client_name"
+        pr.failed = True
         pr.save()
         return False
 
-    mark_running(pr, True) # saving for progress
-    
+    # mark running by setting fields directly
+    pr.status = "provisioning"
+    pr.save()
+
     project_name = generate_project_name(pr.client_name)
     pr.project_name = project_name
-    pr.status = "provisioning"
     pr.save()
 
     try:
         payload = {"name": project_name, "description": f"Project for {pr.client_name}"}
-        resp = _post("/project/create", json=payload)  # retry-enabled by default
+        resp = _post("/project/create", json=payload)
 
-        # extract project id robustly (will pick up "projectId")
         project_id = extract_id_from_resp(resp)
         if not project_id:
             pr.status = "failed"
             pr.detail = f"project.create returned unexpected response: {resp}"
+            pr.failed = True
             pr.save()
             logger.error("project.create unexpected response for prov_request=%s: %s", prov_request_id, resp)
             return False
 
         pr.project_id = project_id
+        pr.project_created = True
         pr.status = "project_created"
         pr.detail = f"Project created (id={project_id})"
         pr.save()
-        # mark progress
-        mark_step(pr, ProvisionRequest.Progress.PROJECT_CREATED, status_text="project_created")
-        
+
         logger.info("Project created for prov_request=%s project_id=%s", prov_request_id, project_id)
         print(f'\n Project Created Successfully\n')
         return True
 
     except DokployError as e:
         pr.status = "failed"
+        pr.failed = True
         pr.detail = f"Project creation failed: {e}"
         pr.save()
         logger.exception("Project creation DokployError for prov_request=%s: %s", prov_request_id, e)
         return False
-
-
+    except Exception as e:
+        pr.status = "failed"
+        pr.failed = True
+        pr.detail = (pr.detail or "") + f" | unexpected error: {e}"
+        pr.save()
+        logger.exception("Create Project: unexpected error for prov_request=%s", prov_request_id)
+        return False
+    
 # 2 create Backend Service
 def create_backend_service_task(prov_request_id) -> bool:
     """
@@ -200,112 +307,120 @@ def create_backend_service_task(prov_request_id) -> bool:
     # -------------------
     # Step A: Create application (if not already created)
     # -------------------
-    if not pr.backend_created or not pr.backend_id:
-        try:
-            print('\n Creating BackendService \n ')
-            logger.info("Creating backend application for prov_request=%s name=%s", prov_request_id, backend_name)
-            resp = create_application(project_id=pr.project_id,
-                                      name=backend_name,
-                                      description=f"Backend for {pr.client_name or backend_name}")
-            app_id = None
-            # robust extraction
-            if isinstance(resp, dict):
-                app_id = resp.get("applicationId") or resp.get("applicationId") or resp.get("id") or resp.get("_id")
-            if not app_id:
-                app_id = extract_id_from_resp(resp)
-            if not app_id:
-                raise DokployError(f"application.create returned no application id: {resp}")
+    try: # top level try block
+        if not pr.backend_created or not pr.backend_id:
+            try:
+                print('\n Creating BackendService \n ')
+                logger.info("Creating backend application for prov_request=%s name=%s", prov_request_id, backend_name)
+                resp = create_application(project_id=pr.project_id,
+                                        name=backend_name,
+                                        description=f"Backend for {pr.client_name or backend_name}")
+                app_id = None
+                # robust extraction
+                if isinstance(resp, dict):
+                    app_id = resp.get("applicationId") or resp.get("applicationId") or resp.get("id") or resp.get("_id")
+                if not app_id:
+                    app_id = extract_id_from_resp(resp)
+                if not app_id:
+                    raise DokployError(f"application.create returned no application id: {resp}")
 
-            pr.backend_id = app_id
-            pr.backend_created = True
-            pr.status = "backend_created"
-            pr.detail = (pr.detail or "") + f" | backend_created:{app_id}"
-            pr.save()
-            logger.info("Backend application created: prov_request=%s app_id=%s", prov_request_id, app_id)
+                pr.backend_id = app_id
+                pr.backend_created = True
+                pr.status = "backend_created"
+                pr.detail = (pr.detail or "") + f" | backend_created:{app_id}"
+                pr.save()
+                logger.info("Backend application created: prov_request=%s app_id=%s", prov_request_id, app_id)
 
-        except DokployError as e:
+            except DokployError as e:
+                pr.status = "failed"
+                pr.failed = True
+                pr.detail = (pr.detail or "") + f" | application.create error: {e}"
+                pr.save()
+                logger.exception("create_backend_service_task: application.create failed for prov_request=%s: %s", prov_request_id, e)
+                return False
+        else:
+            logger.info("create_backend_service_task: backend already created for prov_request=%s, id=%s", prov_request_id, pr.backend_id)
+
+        # Short sanity check: ensure backend_id is present
+        if not pr.backend_id:
             pr.status = "failed"
             pr.failed = True
-            pr.detail = (pr.detail or "") + f" | application.create error: {e}"
+            pr.detail = (pr.detail or "") + " | backend_id missing after create step"
             pr.save()
-            logger.exception("create_backend_service_task: application.create failed for prov_request=%s: %s", prov_request_id, e)
+            logger.error("create_backend_service_task: backend_id missing for prov_request=%s after creation", prov_request_id)
             return False
-    else:
-        logger.info("create_backend_service_task: backend already created for prov_request=%s, id=%s", prov_request_id, pr.backend_id)
 
-    # Short sanity check: ensure backend_id is present
-    if not pr.backend_id:
+        app_id = pr.backend_id
+
+        # -------------------
+        # Step B: Attach Git provider (if not already attached)
+        # -------------------
+        if not pr.backend_git_attached:
+            try:
+                git_url = getattr(settings, "BACKEND_REPO", None)
+                # allow per-request override if stored (optional)
+                if hasattr(pr, "backend_repo") and pr.backend_repo:
+                    git_url = pr.backend_repo
+
+                if not git_url:
+                    raise DokployError("BACKEND_REPO not configured")
+
+                logger.info("Attaching git provider for backend app %s prov_request=%s", app_id, prov_request_id)
+                git_resp = save_git_provider(application_id=app_id, custom_git_url=git_url, branch="main", build_path="/")
+                pr.backend_git_attached = True
+                pr.status = "backend_git_attached"
+                pr.detail = (pr.detail or "") + f" | backend_git_attached:{git_resp}"
+                pr.save()
+                logger.info("Git provider attached for backend app %s prov_request=%s", app_id, prov_request_id)
+
+            except DokployError as e:
+                pr.status = "failed"
+                pr.failed = True
+                pr.detail = (pr.detail or "") + f" | save_git_provider error: {e}"
+                pr.save()
+                logger.exception("create_backend_service_task: save_git_provider failed for prov_request=%s: %s", prov_request_id, e)
+                return False
+        else:
+            logger.info("create_backend_service_task: backend git already attached for prov_request=%s", prov_request_id)
+
+        # -------------------
+        # Step C: Set build type (if not already configured)
+        # -------------------
+        if not pr.backend_build_configured:
+            try:
+                logger.info("Setting build type for backend app %s prov_request=%s", app_id, prov_request_id)
+                # choose defaults; you can change dockerfile path etc. or provide overrides in pr
+                build_resp = save_build_type(
+                    application_id=app_id,
+                    build_type="dockerfile",
+                    dockerfile="./DockerFile",
+                    docker_context_path="",
+                    docker_build_stage="",
+                    is_static_spa=False
+                )
+                pr.backend_build_configured = True
+                pr.status = "backend_ready"
+                pr.detail = (pr.detail or "") + f" | backend_build_configured:{build_resp}"
+                pr.save()
+                logger.info("Build type configured for backend app %s prov_request=%s", app_id, prov_request_id)
+
+            except DokployError as e:
+                pr.status = "failed"
+                pr.failed = True
+                pr.detail = (pr.detail or "") + f" | save_build_type error: {e}"
+                pr.save()
+                logger.exception("create_backend_service_task: save_build_type failed for prov_request=%s: %s", prov_request_id, e)
+                return False
+        else:
+            logger.info("create_backend_service_task: backend build already configured for prov_request=%s", prov_request_id)
+    except Exception as e:
         pr.status = "failed"
         pr.failed = True
-        pr.detail = (pr.detail or "") + " | backend_id missing after create step"
+        pr.detail = (pr.detail or "") + f" | unexpected error: {e}"
         pr.save()
-        logger.error("create_backend_service_task: backend_id missing for prov_request=%s after creation", prov_request_id)
+        logger.exception("create_backend_service_task: unexpected error for prov_request=%s", prov_request_id)
         return False
-
-    app_id = pr.backend_id
-
-    # -------------------
-    # Step B: Attach Git provider (if not already attached)
-    # -------------------
-    if not pr.backend_git_attached:
-        try:
-            git_url = getattr(settings, "BACKEND_REPO", None)
-            # allow per-request override if stored (optional)
-            if hasattr(pr, "backend_repo") and pr.backend_repo:
-                git_url = pr.backend_repo
-
-            if not git_url:
-                raise DokployError("BACKEND_REPO not configured")
-
-            logger.info("Attaching git provider for backend app %s prov_request=%s", app_id, prov_request_id)
-            git_resp = save_git_provider(application_id=app_id, custom_git_url=git_url, branch="main", build_path="/")
-            pr.backend_git_attached = True
-            pr.status = "backend_git_attached"
-            pr.detail = (pr.detail or "") + f" | backend_git_attached:{git_resp}"
-            pr.save()
-            logger.info("Git provider attached for backend app %s prov_request=%s", app_id, prov_request_id)
-
-        except DokployError as e:
-            pr.status = "failed"
-            pr.failed = True
-            pr.detail = (pr.detail or "") + f" | save_git_provider error: {e}"
-            pr.save()
-            logger.exception("create_backend_service_task: save_git_provider failed for prov_request=%s: %s", prov_request_id, e)
-            return False
-    else:
-        logger.info("create_backend_service_task: backend git already attached for prov_request=%s", prov_request_id)
-
-    # -------------------
-    # Step C: Set build type (if not already configured)
-    # -------------------
-    if not pr.backend_build_configured:
-        try:
-            logger.info("Setting build type for backend app %s prov_request=%s", app_id, prov_request_id)
-            # choose defaults; you can change dockerfile path etc. or provide overrides in pr
-            build_resp = save_build_type(
-                application_id=app_id,
-                build_type="dockerfile",
-                dockerfile="./DockerFile",
-                docker_context_path="",
-                docker_build_stage="",
-                is_static_spa=False
-            )
-            pr.backend_build_configured = True
-            pr.status = "backend_ready"
-            pr.detail = (pr.detail or "") + f" | backend_build_configured:{build_resp}"
-            pr.save()
-            logger.info("Build type configured for backend app %s prov_request=%s", app_id, prov_request_id)
-
-        except DokployError as e:
-            pr.status = "failed"
-            pr.failed = True
-            pr.detail = (pr.detail or "") + f" | save_build_type error: {e}"
-            pr.save()
-            logger.exception("create_backend_service_task: save_build_type failed for prov_request=%s: %s", prov_request_id, e)
-            return False
-    else:
-        logger.info("create_backend_service_task: backend build already configured for prov_request=%s", prov_request_id)
-
+    
     # All backend steps done successfully
     pr.status = pr.status or "backend_done"
     pr.save()
@@ -322,7 +437,6 @@ def find_project_in_all(projects_list, project_id):
         if proj.get("projectId") == project_id or proj.get("projectId") == str(project_id):
             return proj
     return None
-
 
 def choose_postgres_entry(postgres_list):
     """
@@ -341,170 +455,171 @@ def choose_postgres_entry(postgres_list):
     except Exception:
         return postgres_list[0]
 
+def _fetch_postgres_entry_for_project(projects_list, project_id):
+    project = find_project_in_all(projects_list, project_id)
+    if not project:
+        return None
+    postgres_entries = project.get("postgres", []) or []
+    return choose_postgres_entry(postgres_entries)
+
+def _populate_db_fields_from_postgres_entry(pr, postgres_entry):
+    """Populate ProvisionRequest DB fields from a postgres entry dict and save."""
+    postgres_id = (
+        postgres_entry.get("postgresId")
+        or postgres_entry.get("id")
+        or postgres_entry.get("_id")
+        or postgres_entry.get("postgres_id")
+    )
+    app_name = postgres_entry.get("appName") or postgres_entry.get("app_name") or postgres_entry.get("name") or ""
+    database_name = postgres_entry.get("databaseName") or postgres_entry.get("database_name") or ""
+    database_user = postgres_entry.get("databaseUser") or postgres_entry.get("database_user") or ""
+    database_password = postgres_entry.get("databasePassword") or postgres_entry.get("database_password") or ""
+    external_port = postgres_entry.get("externalPort") or postgres_entry.get("port") or None
+    db_port = str(external_port) if external_port else "5432"
+
+    pr.db_id = postgres_id
+    pr.db_app_name = app_name
+    pr.db_name = database_name
+    pr.db_user = database_user
+    pr.db_password = database_password
+    pr.db_port = db_port
+    pr.db_created = True
+    pr.detail = (pr.detail or "") + f" | postgres_populated:{postgres_id}"
+    pr.status = pr.status or "db_created"
+    pr.save()
+
 
 def create_postgres_task(prov_request_id) -> bool:
     """
-    Step 3: create postgres, then read project.all to extract DB info,
-    and write env into backend application (application.saveEnvironment).
-    Returns True on success, False on permanent failure.
+    Resume-aware:
+      - If pr.db_created True and db fields exist -> skip creation (but ensure fields present).
+      - Else: create postgres via create_postgres(...) and then query project.all to extract the postgres entry.
+      - After extraction, set backend environment variables (application.saveEnvironment) and mark backend_env_configured.
     """
-    print("\n Creating Data Base \n")
     try:
         pr = ProvisionRequest.objects.get(id=prov_request_id)
     except ProvisionRequest.DoesNotExist:
-        logger.error("ProvisionRequest %s does not exist", prov_request_id)
+        logger.error("create_postgres_task: ProvisionRequest %s does not exist", prov_request_id)
         return False
 
+    # sanity checks
     if not pr.project_id:
         pr.status = "failed"
-        pr.detail = "Cannot create DB: missing project_id"
+        pr.detail = (pr.detail or "") + " | cannot create DB: missing project_id"
+        pr.failed = True
         pr.save()
+        logger.error("create_postgres_task: missing project_id for prov_request=%s", prov_request_id)
         return False
 
     if not pr.backend_id:
         pr.status = "failed"
-        pr.detail = "Cannot set environment: missing backend application id"
+        pr.detail = (pr.detail or "") + " | cannot set environment: missing backend application id"
+        pr.failed = True
         pr.save()
+        logger.error("create_postgres_task: missing backend_id for prov_request=%s", prov_request_id)
         return False
 
-    # Build sensible names / creds
-    db_name = (pr.project_name or "lms").lower().replace("-", "_") + "_db"
-    db_user = "lms_user"
-    # generate a reasonably strong password (url-safe, but avoid '=')
-    db_password = secrets.token_urlsafe(24).replace("=", "")[:32]
+    # If db already created and db fields are present, skip creation step
+    if pr.db_created and pr.db_id and pr.db_app_name and pr.db_name and pr.db_user and pr.db_password:
+        logger.info("create_postgres_task: DB already created for prov_request=%s db_id=%s", prov_request_id, pr.db_id)
+    else:
+        # Build sensible names / creds
+        db_name = (pr.project_name or "lms").lower().replace("-", "_") + "_db"
+        db_user = "lms_user"
+        db_password = secrets.token_urlsafe(24).replace("=", "")[:32]
 
-    postgres_payload = {
-        "name": "lms-db",
-        "appName": "lms",                # dokploy will generate a real appName value like "lms-b4tbmo"
-        "databaseName": db_name,
-        "databaseUser": db_user,
-        "databasePassword": db_password,
-        "dockerImage": "postgres:15",
-        "projectId": pr.project_id,
-        "description": f"Postgres DB for {pr.client_name or pr.project_name}"
-    }
-
-    # 1) Create postgres
-    try:
-        logger.info("Creating postgres for prov_request=%s project=%s", prov_request_id, pr.project_id)
-        # dokploy returns True on success per your note. But still capture response.
-        resp = _post("/postgres.create/", json=postgres_payload)
-
-        print("\n DB Created Successfully \n")
-        # If Dokploy returns True, continue to fetch project data. If it returns something else, log it.
-        logger.debug("postgres.create response: %s", resp)
-
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = f"postgres.create failed: {e}"
-        pr.save()
-        logger.exception("postgres.create failed for prov_request=%s: %s", prov_request_id, e)
-        return False
-
-    # 2) Read project.all, find our project, then inspect postgres list
-    print("\n Reading Projects with sleep \n")
-    time.sleep(1)
-    try:
-        all_projects = _get("/project.all")  # retry-enabled by default
-        project = find_project_in_all(all_projects, pr.project_id)
-        if not project:
-            pr.status = "failed"
-            pr.detail = "project.all did not contain our project after postgres.create"
+        postgres_payload_name = "lms-db"
+        try:
+            logger.info("Creating postgres for prov_request=%s project=%s", prov_request_id, pr.project_id)
+            resp = create_postgres(
+                project_id=pr.project_id,
+                name=postgres_payload_name,
+                app_name="lms",
+                database_name=db_name,
+                database_user=db_user,
+                database_password=db_password,
+                docker_image="postgres:15",
+            )
+            # create_postgres may return True or some dict; just log it
+            pr.detail = (pr.detail or "") + f" | postgres.create_resp:{resp}"
             pr.save()
-            logger.error("project.all did not include project_id=%s", pr.project_id)
+            logger.debug("postgres.create resp: %s", resp)
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | postgres.create error: {e}"
+            pr.save()
+            logger.exception("create_postgres_task: postgres.create failed for prov_request=%s: %s", prov_request_id, e)
             return False
 
-        postgres_entries = project.get("postgres", []) or []
-        postgres_entry = choose_postgres_entry(postgres_entries)
-        if not postgres_entry:
+        # Wait briefly and then query project.all to find the created postgres entry
+        time.sleep(1)
+
+        try:
+            all_projects = get_all_projects()
+            postgres_entry = _fetch_postgres_entry_for_project(all_projects, pr.project_id)
+            if not postgres_entry:
+                pr.status = "failed"
+                pr.failed = True
+                pr.detail = (pr.detail or "") + " | project.all did not show postgres entry after creation"
+                pr.save()
+                logger.error("create_postgres_task: project.all missing postgres entry for project %s", pr.project_id)
+                return False
+
+            # populate pr fields from the found postgres entry
+            _populate_db_fields_from_postgres_entry(pr, postgres_entry)
+            logger.info("create_postgres_task: populated DB fields for prov_request=%s", prov_request_id)
+
+        except DokployError as e:
             pr.status = "failed"
-            pr.detail = "No postgres entries found in project after creation"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | project.all error: {e}"
             pr.save()
-            logger.error("No postgres entries found for project %s", pr.project_id)
+            logger.exception("create_postgres_task: project.all failed for prov_request=%s: %s", prov_request_id, e)
             return False
 
-        print("\n DB Extracting Values \n")
-        # Extract useful values with safety checks
-        postgres_id = (
-            postgres_entry.get("postgresId")
-            or postgres_entry.get("id")
-            or postgres_entry.get("_id")
-            or postgres_entry.get("postgres_id")
-        )
-        app_name = postgres_entry.get("appName") or postgres_entry.get("name") or ""
-        database_name = postgres_entry.get("databaseName") or postgres_entry.get("database_name") or ""
-        database_user = postgres_entry.get("databaseUser") or postgres_entry.get("database_user") or ""
-        database_password = postgres_entry.get("databasePassword") or postgres_entry.get("database_password") or ""
-        external_port = postgres_entry.get("externalPort") or postgres_entry.get("port") or None
+    # Now ensure backend environment is set (resume-aware)
+    if pr.backend_env_configured:
+        logger.info("create_postgres_task: backend environment already configured for prov_request=%s", prov_request_id)
+        return True
 
-        # fallback port
-        db_port = str(external_port) if external_port else "5432"
-
-        # persist DB details to ProvisionRequest (if you added those fields)
-        pr.db_id = postgres_id
-        pr.db_app_name = app_name
-        pr.db_name = database_name
-        pr.db_user = database_user
-        pr.db_password = database_password
-        pr.db_port = db_port
-        pr.status = "db_created"
-        pr.detail = (pr.detail or "") + f" | postgres_created:{postgres_id}"
-        pr.save()
-
-        logger.info("Postgres entry extracted for prov_request=%s: app=%s db=%s user=%s",
-                    prov_request_id, app_name, database_name, database_user)
-
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = f"project.all failed: {e}"
-        pr.save()
-        logger.exception("project.all failed for prov_request=%s: %s", prov_request_id, e)
-        return False
-
-    # 3) Build environment string and call application.saveEnvironment for backend app
-    print("\n Setting up Environments Variables \n")
+    # Build env content expected by your backend and set it on the backend app
     try:
-        # Build env content expected by your backend
-        # Use the appName (service host) as DB host. This is what you showed in example:
-        # DB_HOST = 'lms-b4tbmo'  # from appName
         env_lines = [
-            f"POSTGRES_HOST={app_name}",
-            f"POSTGRES_PORT={db_port}",
-            f"POSTGRES_DB={database_name}",
-            f"POSTGRES_USER={database_user}",
-            f"POSTGRES_PASSWORD={database_password}",
-            # add a generated DJANGO_SECRET_KEY if you want the backend to have one:
+            f"POSTGRES_HOST={pr.db_app_name}",
+            f"POSTGRES_PORT={pr.db_port or '5432'}",
+            f"POSTGRES_DB={pr.db_name}",
+            f"POSTGRES_USER={pr.db_user}",
+            f"POSTGRES_PASSWORD={pr.db_password}",
             f"DJANGO_SECRET_KEY={secrets.token_urlsafe(48)}",
             "ALLOWED_HOSTS=*",
         ]
-        env_payload = {
-            "applicationId": pr.backend_id,
-            "env": "\n".join(env_lines)
-        }
+        env_payload = "\n".join(env_lines)
+
         logger.info("Setting backend environment for app %s prov_request=%s", pr.backend_id, prov_request_id)
-        set_env_resp = _post("/application.saveEnvironment", json=env_payload)
-
+        resp = save_environment(application_id=pr.backend_id, env_str=env_payload)
+        pr.backend_env_configured = True
         pr.status = "backend_env_configured"
-        pr.detail = (pr.detail or "") + f" | backend_env_set:{set_env_resp}"
+        pr.detail = (pr.detail or "") + f" | backend_env_set:{resp}"
         pr.save()
+        logger.info("create_postgres_task: backend environment configured for prov_request=%s", prov_request_id)
 
-        logger.info("Backend environment configured for prov_request=%s", prov_request_id)
-        print("\n Envs are there to use \n")
         return True
 
     except DokployError as e:
         pr.status = "failed"
-        pr.detail = f"application.saveEnvironment failed: {e}"
+        pr.failed = True
+        pr.detail = (pr.detail or "") + f" | application.saveEnvironment failed: {e}"
         pr.save()
-        logger.exception("Failed to set backend environment for prov_request=%s: %s", prov_request_id, e)
+        logger.exception("create_postgres_task: save_environment failed for prov_request=%s: %s", prov_request_id, e)
         return False
-
 
 def deploy_db_then_app_quick(prov_request_id) -> tuple:
     """
-    Quick deploy flow: trigger postgres.deploy -> wait 1s -> trigger application.deploy.
-    Returns (postgres_response, application_response) on success, (None, None) on failure.
-    Assumes pr.db_id and pr.backend_id are already set.
+    Deploy DB first then app. Resume-aware using flags:
+      - postgres_deploy_triggered
+      - backend_deploy_triggered
+    Returns (pg_resp, app_resp) or (None, None) on failure.
     """
     try:
         pr = ProvisionRequest.objects.get(id=prov_request_id)
@@ -514,6 +629,7 @@ def deploy_db_then_app_quick(prov_request_id) -> tuple:
 
     if not pr.db_id:
         pr.status = "failed"
+        pr.failed = True
         pr.detail = (pr.detail or "") + " | missing db_id for deploy"
         pr.save()
         logger.error("deploy_db_then_app_quick: missing db_id for prov_request=%s", prov_request_id)
@@ -521,243 +637,239 @@ def deploy_db_then_app_quick(prov_request_id) -> tuple:
 
     if not pr.backend_id:
         pr.status = "failed"
+        pr.failed = True
         pr.detail = (pr.detail or "") + " | missing backend_id for deploy"
         pr.save()
         logger.error("deploy_db_then_app_quick: missing backend_id for prov_request=%s", prov_request_id)
         return None, None
 
-    # 1) Trigger DB deploy
-    print(f'\n Deploying The Database \n')
-    try:
-        logger.info("Triggering postgres.deploy for prov_request=%s postgresId=%s", prov_request_id, pr.db_id)
-        pg_resp = _post("/postgres.deploy", json={"postgresId": pr.db_id})
-        # Save immediate response for debugging
-        pr.detail = (pr.detail or "") + f" | postgres_deploy_resp:{pg_resp}"
-        pr.status = "postgres_deploy_triggered"
-        pr.save()
-        
-        logger.info("postgres.deploy response for prov_request=%s: %s", prov_request_id, pg_resp)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | postgres.deploy_error:{e}"
-        pr.save()
-        logger.exception("postgres.deploy failed for prov_request=%s: %s", prov_request_id, e)
-        return None, None
+    pg_resp = None
+    app_resp = None
 
-    # 2) Wait 1 second
-    logger.debug("Sleeping 1 second before deploying application for prov_request=%s", prov_request_id)
-    print(f'\n Deploying The Backend with 1 second delay \n')
+    # 1) Trigger DB deploy (if not already triggered)
+    if not pr.postgres_deploy_triggered:
+        try:
+            logger.info("Triggering postgres.deploy for prov_request=%s postgresId=%s", prov_request_id, pr.db_id)
+            pg_resp = deploy_postgres(postgres_id=pr.db_id)
+            pr.postgres_deploy_triggered = True
+            pr.status = "postgres_deploy_triggered"
+            pr.detail = (pr.detail or "") + f" | postgres_deploy_resp:{pg_resp}"
+            pr.save()
+            logger.info("postgres.deploy response for prov_request=%s: %s", prov_request_id, pg_resp)
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | postgres.deploy_error:{e}"
+            pr.save()
+            logger.exception("postgres.deploy failed for prov_request=%s: %s", prov_request_id, e)
+            return None, None
+    else:
+        logger.info("deploy_db_then_app_quick: postgres.deploy already triggered for prov_request=%s", prov_request_id)
+
+    # small delay before application deploy (1 sec per your workflow)
     time.sleep(1)
 
-    # 3) Trigger application deploy
-    try:
-        logger.info("Triggering application.deploy for prov_request=%s applicationId=%s", prov_request_id, pr.backend_id)
-        app_resp = _post("/application.deploy", json={"applicationId": pr.backend_id})
-        pr.detail = (pr.detail or "") + f" | application_deploy_resp:{app_resp}"
-        pr.status = "deploys_triggered"
-        pr.save()
-        logger.info("application.deploy response for prov_request=%s: %s", prov_request_id, app_resp)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.deploy_error:{e}"
-        pr.save()
-        logger.exception("application.deploy failed for prov_request=%s: %s", prov_request_id, e)
-        return pg_resp, None
+    # 2) Trigger application deploy (if not already)
+    if not pr.backend_deploy_triggered:
+        try:
+            logger.info("Triggering application.deploy for prov_request=%s applicationId=%s", prov_request_id, pr.backend_id)
+            app_resp = deploy_application(application_id=pr.backend_id)
+            pr.backend_deploy_triggered = True
+            pr.status = "deploys_triggered"
+            pr.detail = (pr.detail or "") + f" | application_deploy_resp:{app_resp}"
+            pr.save()
+            logger.info("application.deploy response for prov_request=%s: %s", prov_request_id, app_resp)
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | application.deploy_error:{e}"
+            pr.save()
+            logger.exception("application.deploy failed for prov_request=%s: %s", prov_request_id, e)
+            return pg_resp, None
+    else:
+        logger.info("deploy_db_then_app_quick: application.deploy already triggered for prov_request=%s", prov_request_id)
 
-    # Return both responses so caller can inspect and react
     return pg_resp, app_resp
-
 
 # 4 Create Frontend Service and deploy
 def create_frontend_service_task(prov_request_id) -> bool:
     """
-    Create frontend application, attach git provider, set build type, and trigger deploy.
-    - Looks for settings.FRONTEND_REPO or pr.frontend_repo override.
-    - If pr.frontend_build_type (JSON) exists, uses that payload for /application.saveBuildType.
-      Otherwise uses a default SPA-friendly payload (isStaticSpa=True, publishDirectory="build").
+    Resume-aware creation/configuration/deploy of the frontend application.
+
+    Steps (persisted as boolean flags on ProvisionRequest):
+      1. create application -> sets frontend_id, frontend_created
+      2. attach git provider -> sets frontend_git_attached
+      3. set build type -> sets frontend_build_configured
+      4. trigger deploy (after 1s) -> sets frontend_deploy_triggered
+
     Returns True on success, False on failure.
     """
-    
     try:
         pr = ProvisionRequest.objects.get(id=prov_request_id)
     except ProvisionRequest.DoesNotExist:
         logger.error("create_frontend_service_task: ProvisionRequest %s not found", prov_request_id)
         return False
 
+    # require project
     if not pr.project_id:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | cannot create frontend: missing project_id"
+        pr.failed = True
         pr.save()
         logger.error("create_frontend_service_task: missing project_id for prov_request=%s", prov_request_id)
         return False
 
-    # derive a frontend app name
     frontend_name = f"{pr.project_name}-frontend" if pr.project_name else "lms-frontend"
 
-    # 1) Create application (frontend service)
-    print('\n Creating frontend Service \n')
-    try:
-        logger.info("Creating frontend application for prov_request=%s name=%s", prov_request_id, frontend_name)
-        create_payload = {
-            "name": frontend_name,
-            "description": f"Frontend for {pr.client_name or frontend_name}",
-            "projectId": pr.project_id,
-        }
-        resp = _post("/application.create/", json=create_payload)  # retry-enabled
-
-        # extract application id robustly (use your extractor if present)
-        app_id = None
-        if isinstance(resp, dict):
-            # prefer applicationId or id keys
-            app_id = resp.get("applicationId") or resp.get("id") or resp.get("_id")
-        if not app_id and isinstance(resp, str):
-            app_id = resp.strip().strip('"').strip("'")
-
-        # fallback: try generic extractor if present in module
+    # -------------------
+    # Step A: Create application (if not already created)
+    # -------------------
+    if not pr.frontend_created or not pr.frontend_id:
         try:
-            if not app_id and "extract_id_from_resp" in globals():
+            logger.info("Creating frontend application for prov_request=%s name=%s", prov_request_id, frontend_name)
+            resp = create_application(project_id=pr.project_id,
+                                      name=frontend_name,
+                                      description=f"Frontend for {pr.client_name or frontend_name}")
+            app_id = None
+            if isinstance(resp, dict):
+                app_id = resp.get("applicationId") or resp.get("id") or resp.get("_id")
+            if not app_id:
                 app_id = extract_id_from_resp(resp)
-        except Exception:
-            pass
 
-        if not app_id:
-            pr.status = "failed"
-            pr.detail = (pr.detail or "") + f" | application.create returned unexpected response: {resp}"
+            if not app_id:
+                raise DokployError(f"application.create returned no application id: {resp}")
+
+            pr.frontend_id = app_id
+            pr.frontend_created = True
+            pr.status = "frontend_created"
+            pr.detail = (pr.detail or "") + f" | frontend_created:{app_id}"
             pr.save()
-            logger.error("application.create (frontend) returned no id for prov_request=%s response=%s", prov_request_id, resp)
-            return False
+            logger.info("Frontend application created: prov_request=%s app_id=%s", prov_request_id, app_id)
 
-        pr.frontend_id = app_id
-        pr.status = "frontend_created"
-        pr.detail = (pr.detail or "") + f" | frontend_app_created:{app_id}"
-        pr.save()
-        print('\n Frontend Service Created Successfully\n')
-        logger.info("Frontend app created prov_request=%s app_id=%s", prov_request_id, app_id)
-
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.create(frontend) failed: {e}"
-        pr.save()
-        logger.exception("Failed to create frontend application for prov_request=%s: %s", prov_request_id, e)
-        return False
-
-    # 2) Attach Git provider
-    print('\n Git Provider for Frontend\n')
-    try:
-        # allow optional per-request override saved earlier in pr.frontend_repo (if you choose to add)
-        git_url = getattr(settings, "FRONTEND_REPO", None)
-        if hasattr(pr, "frontend_repo") and pr.frontend_repo:
-            git_url = pr.frontend_repo
-
-        if not git_url:
+        except DokployError as e:
             pr.status = "failed"
-            pr.detail = (pr.detail or "") + " | missing FRONTEND_REPO in settings"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | application.create(frontend) error: {e}"
             pr.save()
-            logger.error("Missing FRONTEND_REPO setting; cannot attach git provider for frontend prov_request=%s", prov_request_id)
+            logger.exception("create_frontend_service_task: application.create failed for prov_request=%s: %s", prov_request_id, e)
             return False
+    else:
+        logger.info("create_frontend_service_task: frontend already created for prov_request=%s id=%s", prov_request_id, pr.frontend_id)
 
-        logger.info("Attaching git provider for frontend app %s (prov_request=%s)", app_id, prov_request_id)
-        git_payload = {
-            "customGitBranch": "main",
-            "applicationId": app_id,
-            "customGitBuildPath": "/",
-            "customGitUrl": git_url,
-            "enableSubmodules": False,
-        }
-        git_resp = _post("/application.saveGitProdiver", json=git_payload)  # retry-enabled
-        pr.status = "frontend_git_attached"
-        pr.detail = (pr.detail or "") + f" | frontend_git_attached:{git_resp}"
-        pr.save()
-        print('\n Frontend Git provider saved Successfully\n')
-        logger.info("Git provider attached for frontend app %s prov_request=%s", app_id, prov_request_id)
-
-    except DokployError as e:
+    # sanity check
+    if not pr.frontend_id:
         pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.saveGitProdiver(frontend) failed: {e}"
+        pr.failed = True
+        pr.detail = (pr.detail or "") + " | frontend_id missing after create step"
         pr.save()
-        logger.exception("Failed to attach git provider for frontend prov_request=%s: %s", prov_request_id, e)
+        logger.error("create_frontend_service_task: frontend_id missing for prov_request=%s after creation", prov_request_id)
         return False
 
-    # 3) Configure build type
-    print('\n Frontend Build type setup\n')
-    try:
-        # If you previously stored a JSON build config on pr.frontend_build_type (optional), use it.
-        # Otherwise use sensible default for a static SPA.
-        build_payload = None
-        if hasattr(pr, "frontend_build_type") and pr.frontend_build_type:
-            # expect this is a dict with correct keys for dokploy
-            build_payload = pr.frontend_build_type.copy()
-            build_payload["applicationId"] = app_id
-        else:
-            # default SPA build config — adjust publishDirectory if your frontend uses "dist" or "build"
-            # build_payload = {
-            #     "applicationId": app_id,
-            #     "buildType": "dockerfile",        # keep dockerfile type but mark isStaticSpa True — Dokploy often accepts this
-            #     "dockerfile": "",                # Not used for SPA
-            #     "dockerContextPath": "",
-            #     "dockerBuildStage": "",
-            #     "publishDirectory": "build",     # change to "dist" if your build outputs to dist
-            #     "isStaticSpa": True
-            # }
-            build_payload = {
-            "applicationId": app_id,
-            "buildType": "dockerfile",
-            "dockerfile": "./DockerFile",
-            "dockerContextPath": "",
-            "dockerBuildStage": "",
-            "isStaticSpa": False,
-             }
+    app_id = pr.frontend_id
 
-        logger.info("Setting frontend build type for app %s (prov_request=%s) payload=%s", app_id, prov_request_id, build_payload)
-        build_resp = _post("/application.saveBuildType", json=build_payload)  # retry-enabled
-        pr.status = "frontend_build_configured"
-        pr.detail = (pr.detail or "") + f" | frontend_build_configured:{build_resp}"
-        pr.save()
-        print('\n Frontend Build type setup Successfull\n')
-        logger.info("Frontend build configured for app %s prov_request=%s", app_id, prov_request_id)
+    # -------------------
+    # Step B: Attach Git provider (if not already attached)
+    # -------------------
+    if not pr.frontend_git_attached:
+        try:
+            git_url = getattr(settings, "FRONTEND_REPO", None)
+            if hasattr(pr, "frontend_repo") and pr.frontend_repo:
+                git_url = pr.frontend_repo
 
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.saveBuildType(frontend) failed: {e}"
-        pr.save()
-        logger.exception("Failed to set build type for frontend prov_request=%s: %s", prov_request_id, e)
-        return False
+            if not git_url:
+                raise DokployError("FRONTEND_REPO not configured")
 
-    # 4) Trigger frontend deploy (quick)
-    try:
-        logger.info("Triggering frontend application.deploy for prov_request=%s app=%s", prov_request_id, app_id)
-        deploy_resp = _post("/application.deploy", json={"applicationId": app_id})
-        pr.status = "frontend_deploy_triggered"
-        pr.detail = (pr.detail or "") + f" | frontend_deploy_resp:{deploy_resp}"
-        pr.save()
-        logger.info("application.deploy (frontend) response for prov_request=%s: %s", prov_request_id, deploy_resp)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.deploy(frontend) failed: {e}"
-        pr.save()
-        logger.exception("Failed to deploy frontend app for prov_request=%s: %s", prov_request_id, e)
-        return False
+            logger.info("Attaching git provider for frontend app %s prov_request=%s", app_id, prov_request_id)
+            git_resp = save_git_provider(application_id=app_id, custom_git_url=git_url, branch="main", build_path="/")
+            pr.frontend_git_attached = True
+            pr.status = "frontend_git_attached"
+            pr.detail = (pr.detail or "") + f" | frontend_git_attached:{git_resp}"
+            pr.save()
+            logger.info("Git provider attached for frontend app %s prov_request=%s", app_id, prov_request_id)
 
-    # <-- wait 1 second here so Dokploy registers the build config -->
-    time.sleep(1)
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | save_git_provider(frontend) error: {e}"
+            pr.save()
+            logger.exception("create_frontend_service_task: save_git_provider failed for prov_request=%s: %s", prov_request_id, e)
+            return False
+    else:
+        logger.info("create_frontend_service_task: frontend git already attached for prov_request=%s", prov_request_id)
 
-    # 4) Trigger frontend deploy (quick)
-    print('\n Frontend Deploy Trigger\n')
-    try:
-        logger.info("Triggering frontend application.deploy for prov_request=%s app=%s", prov_request_id, app_id)
-        deploy_resp = _post("/application.deploy", json={"applicationId": app_id})
-        pr.status = "frontend_deploy_triggered"
-        pr.detail = (pr.detail or "") + f" | frontend_deploy_resp:{deploy_resp}"
-        pr.save()
-        logger.info("application.deploy (frontend) response for prov_request=%s: %s", prov_request_id, deploy_resp)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | application.deploy(frontend) failed: {e}"
-        pr.save()
-        logger.exception("Failed to deploy frontend app for prov_request=%s: %s", prov_request_id, e)
-        return False
+    # -------------------
+    # Step C: Set build type (if not already configured)
+    # -------------------
+    if not pr.frontend_build_configured:
+        try:
+            # Prefer per-request build config if present
+            if hasattr(pr, "frontend_build_type") and pr.frontend_build_type:
+                # assume dict saved; inject application id
+                build_kwargs = pr.frontend_build_type.copy()
+                build_kwargs["application_id"] = app_id  # our helper expects application_id param
+                # If your save_build_type signature differs, adapt accordingly
+                build_resp = save_build_type(
+                    application_id=app_id,
+                    build_type=build_kwargs.get("buildType", "dockerfile"),
+                    dockerfile=build_kwargs.get("dockerfile", "./DockerFile"),
+                    docker_context_path=build_kwargs.get("dockerContextPath", ""),
+                    docker_build_stage=build_kwargs.get("dockerBuildStage", ""),
+                    is_static_spa=build_kwargs.get("isStaticSpa", False),
+                    publish_directory=build_kwargs.get("publishDirectory")
+                )
+            else:
+                # sensible default for SPA — static SPA with publish directory "build"
+                build_resp = save_build_type(
+                    application_id=app_id,
+                    build_type="dockerfile",
+                    dockerfile="./DockerFile",
+                    docker_context_path="",
+                    docker_build_stage="",
+                    is_static_spa=True,
+                    publish_directory="build"
+                )
 
-    # success
+            pr.frontend_build_configured = True
+            pr.status = "frontend_build_configured"
+            pr.detail = (pr.detail or "") + f" | frontend_build_configured:{build_resp}"
+            pr.save()
+            logger.info("Frontend build type configured for app %s prov_request=%s", app_id, prov_request_id)
+
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | save_build_type(frontend) error: {e}"
+            pr.save()
+            logger.exception("create_frontend_service_task: save_build_type failed for prov_request=%s: %s", prov_request_id, e)
+            return False
+    else:
+        logger.info("create_frontend_service_task: frontend build already configured for prov_request=%s", prov_request_id)
+
+    # -------------------
+    # Step D: Trigger deploy (if not already triggered)
+    # -------------------
+    if not pr.frontend_deploy_triggered:
+        # small delay so dokploy registers build config (per flow)
+        time.sleep(1)
+        try:
+            logger.info("Triggering frontend application.deploy for prov_request=%s applicationId=%s", prov_request_id, app_id)
+            deploy_resp = deploy_application(application_id=app_id)
+            pr.frontend_deploy_triggered = True
+            pr.status = "frontend_deploy_triggered"
+            pr.detail = (pr.detail or "") + f" | frontend_deploy_resp:{deploy_resp}"
+            pr.save()
+            logger.info("frontend application.deploy response for prov_request=%s: %s", prov_request_id, deploy_resp)
+        except DokployError as e:
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | deploy_application(frontend) error: {e}"
+            pr.save()
+            logger.exception("create_frontend_service_task: deploy_application failed for prov_request=%s: %s", prov_request_id, e)
+            return False
+    else:
+        logger.info("create_frontend_service_task: frontend deploy already triggered for prov_request=%s", prov_request_id)
+
+    # Success - mark ready
     pr.status = "frontend_ready"
     pr.detail = (pr.detail or "") + " | frontend_created_and_deployed"
     pr.save()
@@ -783,9 +895,12 @@ def _sanitize_subdomain(sub: str) -> str:
 
 def create_domains_task(prov_request_id) -> bool:
     """
-    Create frontend and backend domains using provided pr.subdomain and settings.BASE_DOMAIN.
-    - Requires pr.frontend_id and pr.backend_id to be present.
-    - Saves constructed hostnames to pr.frontend_domain and pr.backend_domain.
+    Create frontend and backend domains using pr.subdomain and settings.BASE_DOMAIN.
+    - Resume-aware: will only set pr.domains_configured = True when BOTH domains are successfully created.
+    - If one creation fails, the function marks the ProvisionRequest as failed and returns False.
+    - When the function creates the frontend domain in this run but backend creation fails,
+      it will attempt to delete the frontend domain (best-effort rollback).
+    - Uses create_domain(...) and delete_domain(...) helpers to call dokploy endpoints.
     """
     try:
         pr = ProvisionRequest.objects.get(id=prov_request_id)
@@ -793,11 +908,17 @@ def create_domains_task(prov_request_id) -> bool:
         logger.error("create_domains_task: ProvisionRequest %s not found", prov_request_id)
         return False
 
-    # subdomain is required by your DRF view; still sanitize defensively
+    # If already configured and both hosts exist, short-circuit
+    if pr.domains_configured and pr.frontend_domain and pr.backend_domain:
+        logger.info("create_domains_task: domains already configured for prov_request=%s", prov_request_id)
+        return True
+
+    # sanitize and validate input
     sub_raw = (pr.subdomain or "").strip()
     if not sub_raw:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | missing subdomain (should not happen - view validates)"
+        pr.failed = True
         pr.save()
         logger.error("create_domains_task: missing subdomain for prov_request=%s", prov_request_id)
         return False
@@ -806,6 +927,7 @@ def create_domains_task(prov_request_id) -> bool:
     if not sub:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + f" | invalid subdomain after sanitization: {sub_raw}"
+        pr.failed = True
         pr.save()
         logger.error("create_domains_task: sanitized subdomain is empty for prov_request=%s input=%s", prov_request_id, sub_raw)
         return False
@@ -814,13 +936,16 @@ def create_domains_task(prov_request_id) -> bool:
     if not base_domain:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | missing BASE_DOMAIN in settings"
+        pr.failed = True
         pr.save()
         logger.error("create_domains_task: BASE_DOMAIN not configured for prov_request=%s", prov_request_id)
         return False
 
+    # ensure app ids exist
     if not pr.frontend_id:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | missing frontend_id (create frontend first)"
+        pr.failed = True
         pr.save()
         logger.error("create_domains_task: missing frontend_id for prov_request=%s", prov_request_id)
         return False
@@ -828,6 +953,7 @@ def create_domains_task(prov_request_id) -> bool:
     if not pr.backend_id:
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | missing backend_id (create backend first)"
+        pr.failed = True
         pr.save()
         logger.error("create_domains_task: missing backend_id for prov_request=%s", prov_request_id)
         return False
@@ -835,50 +961,138 @@ def create_domains_task(prov_request_id) -> bool:
     frontend_host = f"{sub}.{base_domain}"
     backend_host = f"{sub}-backend.{base_domain}"
 
-    def domain_payload(app_id: str, host: str) -> dict:
-        return {
-            "host": host,
-            "port": 80,
-            "https": True,
-            "applicationId": app_id,
-            "certificateType": "letsencrypt",
-            "domainType": "application",
-        }
+    # helper to call create_domain and return (True, resp) or (False, exception)
+    def _attempt_create(app_id: str, host: str):
+        try:
+            resp = create_domain(application_id=app_id, host=host, port=80, https=True,
+                                 certificate_type="letsencrypt", domain_type="application")
+            return True, resp
+        except DokployError as e:
+            return False, e
 
-    # Create frontend domain
-    try:
-        logger.info("Creating frontend domain %s for app=%s (prov=%s)", frontend_host, pr.frontend_id, prov_request_id)
-        _post("/domain.create", json=domain_payload(pr.frontend_id, frontend_host))
-        # we intentionally do NOT parse Dokploy response — we trust our host pattern
-        pr.frontend_domain = frontend_host
-        pr.detail = (pr.detail or "") + f" | frontend_domain_set:{frontend_host}"
-        pr.save()
-        logger.info("Frontend domain set to %s for prov_request=%s", frontend_host, prov_request_id)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | frontend domain.create error: {e}"
-        pr.save()
-        logger.exception("create_domains_task: frontend domain.create failed for prov_request=%s: %s", prov_request_id, e)
-        return False
+    created_frontend = False       # overall truth that frontend is present (existing or newly created)
+    created_backend = False
+    created_frontend_now = False   # True if we created it in this run and should rollback on backend failure
+    created_backend_now = False
 
-    # slight pause to let domain propagation/startup (1s is fine)
+    frontend_resp = None
+    backend_resp = None
+    frontend_domain_id = None
+    backend_domain_id = None
+
+    # Try frontend domain if not already present
+    if pr.frontend_domain and pr.frontend_domain == frontend_host:
+        logger.info("create_domains_task: frontend domain already present on record for prov_request=%s", prov_request_id)
+        created_frontend = True
+        # try to read domain id if stored
+        if hasattr(pr, "frontend_domain_id") and pr.frontend_domain_id:
+            frontend_domain_id = pr.frontend_domain_id
+    else:
+        logger.info("create_domains_task: creating frontend domain %s for app=%s (prov=%s)", frontend_host, pr.frontend_id, prov_request_id)
+        ok, result = _attempt_create(pr.frontend_id, frontend_host)
+        if ok:
+            created_frontend = True
+            created_frontend_now = True
+            frontend_resp = result
+            # extract domainId if present
+            if isinstance(frontend_resp, dict):
+                frontend_domain_id = frontend_resp.get("domainId") or extract_id_from_resp(frontend_resp)
+            else:
+                frontend_domain_id = extract_id_from_resp(frontend_resp)
+
+            # save the host and (if model supports) the domain id
+            pr.frontend_domain = frontend_host
+            if hasattr(pr, "frontend_domain_id"):
+                pr.frontend_domain_id = frontend_domain_id
+            else:
+                # persist domainId into detail as fallback
+                pr.detail = (pr.detail or "") + f" | frontend_domain_id:{frontend_domain_id}"
+            pr.detail = (pr.detail or "") + f" | frontend_domain_created:{frontend_host}"
+            pr.save()
+            logger.info("Frontend domain created for prov_request=%s host=%s resp=%s", prov_request_id, frontend_host, frontend_resp)
+        else:
+            # frontend creation failed — record and fail
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | frontend domain.create error: {result}"
+            pr.save()
+            logger.exception("create_domains_task: frontend domain.create failed for prov_request=%s: %s", prov_request_id, result)
+            return False
+
+    # small wait before creating backend domain
     time.sleep(1)
 
-    # Create backend domain
-    try:
-        logger.info("Creating backend domain %s for app=%s (prov=%s)", backend_host, pr.backend_id, prov_request_id)
-        _post("/domain.create", json=domain_payload(pr.backend_id, backend_host))
-        pr.backend_domain = backend_host
-        pr.detail = (pr.detail or "") + f" | backend_domain_set:{backend_host}"
-        pr.status = "domains_configured"
-        pr.save()
-        logger.info("Backend domain set to %s for prov_request=%s", backend_host, prov_request_id)
-    except DokployError as e:
-        pr.status = "failed"
-        pr.detail = (pr.detail or "") + f" | backend domain.create error: {e}"
-        pr.save()
-        logger.exception("create_domains_task: backend domain.create failed for prov_request=%s: %s", prov_request_id, e)
-        return False
+    # Try backend domain if not already present
+    if pr.backend_domain and pr.backend_domain == backend_host:
+        logger.info("create_domains_task: backend domain already present on record for prov_request=%s", prov_request_id)
+        created_backend = True
+        if hasattr(pr, "backend_domain_id") and pr.backend_domain_id:
+            backend_domain_id = pr.backend_domain_id
+    else:
+        logger.info("create_domains_task: creating backend domain %s for app=%s (prov=%s)", backend_host, pr.backend_id, prov_request_id)
+        ok, result = _attempt_create(pr.backend_id, backend_host)
+        if ok:
+            created_backend = True
+            created_backend_now = True
+            backend_resp = result
+            # extract domainId if present
+            if isinstance(backend_resp, dict):
+                backend_domain_id = backend_resp.get("domainId") or extract_id_from_resp(backend_resp)
+            else:
+                backend_domain_id = extract_id_from_resp(backend_resp)
 
-    return True
+            # save host and domain id if model supports it
+            pr.backend_domain = backend_host
+            if hasattr(pr, "backend_domain_id"):
+                pr.backend_domain_id = backend_domain_id
+            else:
+                pr.detail = (pr.detail or "") + f" | backend_domain_id:{backend_domain_id}"
+            pr.detail = (pr.detail or "") + f" | backend_domain_created:{backend_host}"
+            pr.save()
+            logger.info("Backend domain created for prov_request=%s host=%s resp=%s", prov_request_id, backend_host, backend_resp)
+        else:
+            # backend creation failed — attempt rollback of frontend if we created it now
+            pr.status = "failed"
+            pr.failed = True
+            pr.detail = (pr.detail or "") + f" | backend domain.create error: {result}"
+            pr.save()
+            logger.exception("create_domains_task: backend domain.create failed for prov_request=%s: %s", prov_request_id, result)
+
+            # Rollback frontend domain only if we created it in this run (do not delete pre-existing domains)
+            if created_frontend_now and frontend_domain_id:
+                try:
+                    logger.info("create_domains_task: attempting rollback - deleting frontend domain id=%s for prov_request=%s", frontend_domain_id, prov_request_id)
+                    # delete_domain should be imported from dokploy_client
+                    delete_domain(frontend_domain_id)
+                    # clear persisted frontend domain info if model supports it
+                    pr.frontend_domain = None
+                    if hasattr(pr, "frontend_domain_id"):
+                        pr.frontend_domain_id = None
+                    pr.detail = (pr.detail or "") + f" | frontend_domain_rollback:{frontend_domain_id}"
+                    pr.save()
+                    logger.info("create_domains_task: rolled back frontend domain id=%s for prov_request=%s", frontend_domain_id, prov_request_id)
+                except DokployError as e:
+                    # Rollback failed — log and keep failure state (we already set failed above)
+                    pr.detail = (pr.detail or "") + f" | frontend_domain_rollback_failed:{frontend_domain_id}:{e}"
+                    pr.save()
+                    logger.exception("create_domains_task: failed to rollback frontend domain id=%s for prov_request=%s: %s", frontend_domain_id, prov_request_id, e)
+
+            return False
+
+    # Both created successfully -> mark task as complete
+    if created_frontend and created_backend:
+        pr.domains_configured = True
+        pr.status = "domains_configured"
+        pr.detail = (pr.detail or "") + f" | domains_configured:{frontend_host},{backend_host}"
+        pr.save()
+        logger.info("create_domains_task: both domains created for prov_request=%s frontend=%s backend=%s", prov_request_id, frontend_host, backend_host)
+        return True
+
+    # Should not reach here, but for safety:
+    pr.status = "failed"
+    pr.failed = True
+    pr.detail = (pr.detail or "") + " | unexpected state in create_domains_task"
+    pr.save()
+    logger.error("create_domains_task: unexpected end state for prov_request=%s", prov_request_id)
+    return False
 

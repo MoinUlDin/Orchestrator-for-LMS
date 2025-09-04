@@ -233,3 +233,22 @@ def create_domain(application_id: str, host: str, port: int = 80, https: bool = 
 def get_all_projects() -> List[Dict[str, Any]]:
     """GET /project.all"""
     return _get("/project.all")
+
+def delete_domain(domain_id: str, timeout: int = 30):
+    """
+    Delete a domain by domainId.
+
+    POST /domain.delete
+    Payload: {"domainId": "<id>"}
+
+    Returns whatever dokploy returns (dict/True/etc). Raises DokployError on failure.
+    """
+    if not domain_id:
+        raise ValueError("domain_id is required")
+
+    payload = {"domainId": domain_id}
+    return _post("/domain.delete", json=payload, timeout=timeout)
+
+
+
+
