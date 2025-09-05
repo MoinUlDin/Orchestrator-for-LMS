@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import logging
 # provisioner/scheduler.py
 import requests
-import time
+from django.utils import timezone
 from django.conf import settings
 from .models import ProvisionRequest
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -107,6 +107,8 @@ def backend_health_and_provision_attempt(prov_request_id, payload):
                 pr.status = "completed"
                 pr.detail = (pr.detail or "") + " | internal_provision_success"
                 pr.super_user_created = True
+                pr.internal_provision_scheduled = False
+                pr.backend_health_job_id = None
                 pr.save()
                 logger.info("Provisioning complete for prov_request=%s", prov_request_id)
                 return
@@ -130,6 +132,9 @@ def backend_health_and_provision_attempt(prov_request_id, payload):
         pr.failed = True
         pr.status = "failed"
         pr.detail = (pr.detail or "") + " | backend never became healthy after 10 tries"
+        # clear scheduling flag so operator can reschedule manually if desired
+        pr.internal_provision_scheduled = False
+        pr.backend_health_job_id = None
         pr.save()
         logger.error("Giving up after 10 tries for prov_request=%s", prov_request_id)
         return
@@ -147,11 +152,13 @@ def backend_health_and_provision_attempt(prov_request_id, payload):
     # # --- Schedule itself again ---
     # from provisioner.scheduler import scheduler  # import the global scheduler
     job_id = f"backend-health-{prov_request_id}"
+    run_at = timezone.now() + timedelta(seconds=pr.backend_next_wait)
+
     scheduler.add_job(
         func=backend_health_and_provision_attempt,
         args=[prov_request_id, payload],
         trigger="date",
-        run_date=datetime.now() + timedelta(seconds=pr.backend_next_wait),
+        run_date=run_at,
         id=job_id,
         replace_existing=True,
         max_instances=1,

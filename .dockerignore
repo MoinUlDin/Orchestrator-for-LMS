@@ -1,0 +1,39 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+venv.bak/
+pip-wheel-metadata/
+
+# Git / editor
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Docker helpers
+Dockerfile*
+docker-compose*.yml
+
+# Tests / caches
+.pytest_cache/
+.coverage
+
+# Node (if frontend in same repo)
+node_modules/
+
+# Misc
+*.sqlite3
+*.log

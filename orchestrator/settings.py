@@ -18,22 +18,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # optionally load .env in development
 load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key")
-DEBUG = os.getenv("DJANGO_DEBUG", "True") == "True"
-ALLOWED_HOSTS = ["*"]  # tighten in production
+DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() in ("1", "true", "yes")
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "NOT_secure_use_only_Local_TEsting")
+if not SECRET_KEY and not DEBUG or SECRET_KEY=='NOT_secure_use_only_Local_TEsting':
+    raise Exception("Missing DJANGO_SECRET_KEY for production")
 
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
-
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-n0b#&6zoxy=b*#bhj++9ls$-sj01evv82hfw3nz_r8(_=^_4v@'
-
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
 
 
 # Application definition
@@ -89,14 +83,25 @@ WSGI_APPLICATION = 'orchestrator.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# for local Testing
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': BASE_DIR / 'db.sqlite3',
+#     }
+# }
+
+# for Production only
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("DB_NAME"),
+        "USER": os.environ.get("DB_USER"),
+        "PASSWORD": os.environ.get("DB_PASSWORD"),
+        "HOST": os.environ.get("DB_HOST"),
+        "PORT": os.environ.get("DB_PORT", "5432"),
     }
 }
-
-
 
 # Default repos (fallbacks)
 DEFAULT_BACKEND_REPO = "https://github.com/vista/schoolcare-backend.git"

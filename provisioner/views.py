@@ -61,13 +61,6 @@ def provision_request_view(request):
                     "status": existing.status,
                     "detail_text": existing.detail
                 }, status=status.HTTP_200_OK)
-            else:
-                return Response({
-                    "detail": "already_exists",
-                    "id": existing.id,
-                    "status": existing.status,
-                    "detail_text": existing.detail
-                }, status=status.HTTP_202_ACCEPTED)
         except ProvisionRequest.DoesNotExist:
             pass
 

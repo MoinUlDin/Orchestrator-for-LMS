@@ -191,24 +191,50 @@ def provision_tenant_task(prov_request_id, payload):
     
     # ---------- Step 7: Kick off backend health + internal provision ----------
     if not pr.super_user_created:
-        print("\n bakend Health & Internal Provission call after delay atleast 5 second")
+        # refresh to get latest flag values
         pr.refresh_from_db()
-        dd = global_deley+5
-        time.sleep(dd)
-        logger.info("provision_tenant_task: scheduling backend health + internal provision for prov_request=%s", prov_request_id)
-        n_payload = {
-            "admin_email": payload.get("email"),       
-            "admin_password": payload.get("admin_password"),
-            }
-        scheduler.add_job(
-            backend_health_and_provision_attempt,
-            "date",
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=global_deley),  # ✅ timezone-aware
-            args=[prov_request_id, n_payload],
-            id=f"backend_health_provision_{prov_request_id}",
-            replace_existing=True,
-        )
 
+        if pr.internal_provision_scheduled:
+            logger.info("provision_tenant_task: internal provision job already scheduled for prov_request=%s (job=%s). Skipping schedule.", prov_request_id, pr.backend_health_job_id)
+        else:
+            logger.info("provision_tenant_task: scheduling backend health + internal provision for prov_request=%s", prov_request_id)
+
+            # Build payload (prefer explicit fields in caller payload, fallback to requester's email)
+            admin_email = payload.get("admin_email") or payload.get("email") or pr.email
+            admin_password = payload.get("admin_password")
+            if not admin_password:
+                # generate a temporary password if not supplied
+                admin_password = secrets.token_urlsafe(12)
+
+            n_payload = {
+                "admin_email": admin_email,
+                "admin_password": admin_password,
+            }
+
+            delay_seconds = global_deley + 5
+            run_at = timezone.now() + timedelta(seconds=delay_seconds)
+            job_id = f"backend_health_provision_{prov_request_id}"
+
+            # schedule the job and set flags on the model
+            scheduler.add_job(
+                backend_health_and_provision_attempt,
+                trigger="date",
+                run_date=run_at,
+                args=[prov_request_id, n_payload],
+                id=job_id,
+                replace_existing=True,
+                max_instances=1,
+            )
+
+            pr.internal_provision_scheduled = True
+            pr.backend_health_job_id = job_id
+            pr.status = "waiting_for_internal_provision"
+            pr.detail = (pr.detail or "") + f" | backend_provision_job_scheduled run_in={delay_seconds}s"
+            pr.save()
+
+    pr.status = "waiting_for_internal_provision"
+    pr.detail = (pr.detail or "") + f" | backend_provision_job_scheduled run_in={delay_seconds}s"
+    pr.save()
     logger.info("provision_tenant_task: provisioning completed for prov_request=%s", prov_request_id)
     print("\n\n ---------- Job Complete Successfully ---------- \n")
     return True

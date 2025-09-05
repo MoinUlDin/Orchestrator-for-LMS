@@ -48,6 +48,10 @@ class ProvisionRequest(models.Model):
     
     backend_health_tries = models.IntegerField(default=0)  # how many times we tried
     backend_next_wait = models.IntegerField(default=60)
+    
+    # models.py (add these two fields among the other fields)
+    internal_provision_scheduled = models.BooleanField(default=False)
+    backend_health_job_id = models.CharField(max_length=128, blank=True, null=True)
 
     
     def __str__(self):
