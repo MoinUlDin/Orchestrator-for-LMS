@@ -46,8 +46,12 @@ RUN groupadd --system app && useradd --system --gid app app \
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-cache-dir /wheels/*
 
-# Copy application code as non-root owner
-COPY --chown=app:app . /app
+# Copy application code as root (so we can chmod)
+COPY . /app
+
+# Ensure runserver.sh is executable, then change ownership
+RUN chmod +x /app/runserver.sh \
+ && chown -R app:app /app
 
 # Switch to non-root user
 USER app
